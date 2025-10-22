@@ -164,7 +164,7 @@ async function processImageAsync(jobId, job) {
     // Call OpenAI DALL-E for staging
     const response = await openai.images.edit({
       model: process.env.OPENAI_IMAGE_MODEL || 'dall-e-2',
-      image: imageBuffer,
+      image: new File([imageBuffer], "image.png", { type: "image/png" }),
       prompt: 'Transform this empty room into a beautifully staged, professionally furnished space. Add modern furniture, tasteful decor, proper lighting, and create an inviting atmosphere that would appeal to potential home buyers. Maintain the room\'s architecture and structure.',
       n: 1,
       size: '1024x1024',
