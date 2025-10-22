@@ -121,7 +121,7 @@ app.post('/api/process/:jobId', async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const job = JSON.parse(jobData);
+    const job = typeof jobData === "string" ? JSON.parse(jobData) : jobData;
 
     // Update status to processing
     job.status = 'processing';
@@ -214,7 +214,7 @@ app.get('/api/job/:jobId', async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    res.json(JSON.parse(jobData));
+    res.json(typeof jobData === "string" ? JSON.parse(jobData) : jobData);
   } catch (error) {
     console.error('Status check error:', error);
     res.status(500).json({ error: 'Failed to check job status', details: error.message });
@@ -231,7 +231,7 @@ app.get('/api/download/:jobId', async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const job = JSON.parse(jobData);
+    const job = typeof jobData === "string" ? JSON.parse(jobData) : jobData;
 
     if (job.status !== 'completed') {
       return res.status(400).json({ error: 'Job not completed yet', status: job.status });
