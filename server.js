@@ -165,6 +165,7 @@ async function preprocessImageForOpenAI(imageBuffer) {
       fit: "cover",  // Crop to fill the square
       position: "center"
     })
+    .ensureAlpha()
     .png()
     .toBuffer();
   
