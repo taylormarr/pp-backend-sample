@@ -12,23 +12,28 @@ const FormData = require('form-data');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Sentry
-Sentry.init({
-  dsn: process.env.SENTRY_DSN,
-  environment: process.env.SENTRY_ENV || 'production',
-  tracesSampleRate: parseFloat(process.env.SENTRY_TRACES_SAMPLE_RATE || '1.0'),
-  profilesSampleRate: parseFloat(process.env.SENTRY_PROFILES_SAMPLE_RATE || '1.0'),
-});
+// Initialize Sentry only if DSN is provided
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.SENTRY_ENV || 'production',
+    tracesSampleRate: parseFloat(process.env.SENTRY_TRACES_SAMPLE_RATE || '1.0'),
+    profilesSampleRate: parseFloat(process.env.SENTRY_PROFILES_SAMPLE_RATE || '1.0'),
+  });
+  app.use(Sentry.Handlers.requestHandler());
+  console.log('✅ Sentry initialized');
+} else {
+  console.log('⚠️  Sentry DSN not provided, skipping Sentry initialization');
+}
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(Sentry.Handlers.requestHandler());
 app.use(express.static('public'));
 
 // Configure AWS S3
 const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'us-east-2',
+  region: process.env.AWS_REGION,
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
@@ -48,25 +53,25 @@ const openai = new OpenAI({
 });
 
 // Configure Multer for file uploads
-const upload = multer({ 
+const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
 });
 
 // Health check endpoint
-app.get('/', (req, res) => {
-  res.send('Property Perfected backend is running ✅');
+app.get('/health', async (req, res) => {
+  res.json({ ok: true });
 });
 
-app.get('/health', (req, res) => {
+app.get('/', (req, res) => {
   res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    services: {
-      s3: !!process.env.AWS_ACCESS_KEY_ID,
-      redis: !!process.env.UPSTASH_REDIS_REST_URL,
-      openai: !!process.env.OPENAI_API_KEY,
-      sentry: !!process.env.SENTRY_DSN,
+    status: 'Property Perfected API is running',
+    endpoints: {
+      upload: 'POST /api/upload',
+      process: 'POST /api/process/:jobId',
+      status: 'GET /api/job/:jobId',
+      download: 'GET /api/download/:jobId',
+      webhook: 'POST /api/webhook/mailgun'
     }
   });
 });
@@ -74,289 +79,252 @@ app.get('/health', (req, res) => {
 // Upload endpoint
 app.post('/api/upload', upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) {
+    const { email } = req.body;
+    const file = req.file;
+
+    if (!file) {
       return res.status(400).json({ error: 'No image file provided' });
     }
 
-    const userEmail = req.body.email || 'test@propertyperfected.com';
-    const fileName = `${Date.now()}-${req.file.originalname}`;
-    const s3Key = `uploads/${fileName}`;
+    // Generate unique job ID
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const s3Key = `uploads/${jobId}/${file.originalname}`;
 
     // Upload to S3
-    const uploadParams = {
+    await s3Client.send(new PutObjectCommand({
       Bucket: process.env.S3_UPLOADS_BUCKET,
       Key: s3Key,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype,
-    };
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    }));
 
-    await s3Client.send(new PutObjectCommand(uploadParams));
-    console.log(`✅ Uploaded to S3: ${s3Key}`);
-
-    // Create job in Redis
-    const jobId = `job-${Date.now()}`;
-    const jobData = {
+    // Store job metadata in Redis
+    await redis.set(jobId, JSON.stringify({
       jobId,
-      s3Key,
-      fileName,
-      userEmail,
-      status: 'pending',
+      email,
+      originalImage: s3Key,
+      status: 'uploaded',
       createdAt: new Date().toISOString(),
-    };
-
-    await redis.set(jobId, JSON.stringify(jobData));
-    await redis.lpush('staging-queue', jobId);
-    console.log(`✅ Job queued: ${jobId}`);
+    }));
 
     res.json({
-      success: true,
       jobId,
-      message: 'Image uploaded and queued for staging',
-      s3Key,
+      status: 'uploaded',
+      message: 'Image uploaded successfully. Use /api/process/:jobId to start staging.',
     });
-
   } catch (error) {
     console.error('Upload error:', error);
-    Sentry.captureException(error);
-    res.status(500).json({ error: 'Upload failed', details: error.message });
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    res.status(500).json({ error: 'Failed to upload image' });
   }
 });
 
-// Process staging job
+// Process endpoint - triggers AI staging
 app.post('/api/process/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    
-    // Get job from Redis
-    const jobDataStr = await redis.get(jobId);
-    if (!jobDataStr) {
+
+    // Get job metadata from Redis
+    const jobData = await redis.get(jobId);
+    if (!jobData) {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const jobData = JSON.parse(jobDataStr);
-    
-    // Update job status
-    jobData.status = 'processing';
-    await redis.set(jobId, JSON.stringify(jobData));
+    const job = JSON.parse(jobData);
 
-    // Get original image from S3
-    const getParams = {
+    // Update status to processing
+    job.status = 'processing';
+    await redis.set(jobId, JSON.stringify(job));
+
+    // Start async processing (in production, use a queue worker)
+    processImageAsync(jobId, job);
+
+    res.json({
+      jobId,
+      status: 'processing',
+      message: 'Image processing started. Check status at /api/job/:jobId',
+    });
+  } catch (error) {
+    console.error('Process error:', error);
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    res.status(500).json({ error: 'Failed to start processing' });
+  }
+});
+
+// Async processing function
+async function processImageAsync(jobId, job) {
+  try {
+    // Download image from S3
+    const s3Response = await s3Client.send(new GetObjectCommand({
       Bucket: process.env.S3_UPLOADS_BUCKET,
-      Key: jobData.s3Key,
-    };
-    
-    const s3Response = await s3Client.send(new GetObjectCommand(getParams));
-    const imageBuffer = await streamToBuffer(s3Response.Body);
+      Key: job.originalImage,
+    }));
+
+    // Convert stream to buffer
+    const chunks = [];
+    for await (const chunk of s3Response.Body) {
+      chunks.push(chunk);
+    }
+    const imageBuffer = Buffer.concat(chunks);
+
+    // Convert to base64 for OpenAI
     const base64Image = imageBuffer.toString('base64');
-    const mimeType = s3Response.ContentType || 'image/jpeg';
-    const dataUrl = `data:${mimeType};base64,${base64Image}`;
+    const imageUrl = `data:${s3Response.ContentType};base64,${base64Image}`;
 
-    console.log(`✅ Retrieved image from S3: ${jobData.s3Key}`);
-
-    // Generate staged image with OpenAI DALL-E
-    const prompt = `Transform this empty room into a beautifully staged, professionally furnished living space. Add modern, elegant furniture including a comfortable sofa, stylish coffee table, decorative items, plants, and artwork. Maintain the room's architecture, windows, and lighting. Create a warm, inviting atmosphere that would appeal to home buyers. Keep the style contemporary and neutral.`;
-
-    console.log('🎨 Calling OpenAI DALL-E for staging...');
-    
+    // Call OpenAI DALL-E for staging
     const response = await openai.images.edit({
       model: process.env.OPENAI_IMAGE_MODEL || 'dall-e-2',
       image: imageBuffer,
-      prompt: prompt,
+      prompt: 'Transform this empty room into a beautifully staged, professionally furnished space. Add modern furniture, tasteful decor, proper lighting, and create an inviting atmosphere that would appeal to potential home buyers. Maintain the room\'s architecture and structure.',
       n: 1,
       size: '1024x1024',
     });
 
     const stagedImageUrl = response.data[0].url;
-    console.log(`✅ Generated staged image: ${stagedImageUrl}`);
 
     // Download staged image
-    const imageResponse = await axios.get(stagedImageUrl, { responseType: 'arraybuffer' });
-    const stagedImageBuffer = Buffer.from(imageResponse.data);
+    const stagedImageResponse = await axios.get(stagedImageUrl, { responseType: 'arraybuffer' });
+    const stagedImageBuffer = Buffer.from(stagedImageResponse.data);
 
-    // Upload staged image to S3 outputs bucket
-    const outputFileName = `staged-${jobData.fileName}`;
-    const outputS3Key = `outputs/${outputFileName}`;
-    
-    const outputParams = {
+    // Upload staged image to S3
+    const outputKey = `outputs/${jobId}/staged_${Date.now()}.png`;
+    await s3Client.send(new PutObjectCommand({
       Bucket: process.env.S3_OUTPUTS_BUCKET,
-      Key: outputS3Key,
+      Key: outputKey,
       Body: stagedImageBuffer,
       ContentType: 'image/png',
-    };
+    }));
 
-    await s3Client.send(new PutObjectCommand(outputParams));
-    console.log(`✅ Saved staged image to S3: ${outputS3Key}`);
+    // Update job status
+    job.status = 'completed';
+    job.stagedImage = outputKey;
+    job.completedAt = new Date().toISOString();
+    await redis.set(jobId, JSON.stringify(job));
 
-    // Update job with results
-    jobData.status = 'completed';
-    jobData.outputS3Key = outputS3Key;
-    jobData.completedAt = new Date().toISOString();
-    await redis.set(jobId, JSON.stringify(jobData));
-
-    res.json({
-      success: true,
-      jobId,
-      status: 'completed',
-      originalImage: jobData.s3Key,
-      stagedImage: outputS3Key,
-      downloadUrl: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/download/${jobId}`,
-    });
-
+    console.log(`✅ Job ${jobId} completed successfully`);
   } catch (error) {
-    console.error('Processing error:', error);
-    Sentry.captureException(error);
-    
+    console.error(`❌ Job ${jobId} failed:`, error);
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+
     // Update job status to failed
-    try {
-      const jobDataStr = await redis.get(req.params.jobId);
-      if (jobDataStr) {
-        const jobData = JSON.parse(jobDataStr);
-        jobData.status = 'failed';
-        jobData.error = error.message;
-        await redis.set(req.params.jobId, JSON.stringify(jobData));
-      }
-    } catch (updateError) {
-      console.error('Failed to update job status:', updateError);
-    }
-
-    res.status(500).json({ error: 'Processing failed', details: error.message });
+    job.status = 'failed';
+    job.error = error.message;
+    await redis.set(jobId, JSON.stringify(job));
   }
-});
+}
 
-// Get job status
+// Job status endpoint
 app.get('/api/job/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const jobDataStr = await redis.get(jobId);
-    
-    if (!jobDataStr) {
+    const jobData = await redis.get(jobId);
+
+    if (!jobData) {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const jobData = JSON.parse(jobDataStr);
-    res.json(jobData);
-
+    res.json(JSON.parse(jobData));
   } catch (error) {
-    console.error('Job status error:', error);
-    Sentry.captureException(error);
-    res.status(500).json({ error: 'Failed to get job status' });
+    console.error('Status check error:', error);
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    res.status(500).json({ error: 'Failed to check job status' });
   }
 });
 
-// Download staged image
+// Download endpoint
 app.get('/api/download/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const jobDataStr = await redis.get(jobId);
-    
-    if (!jobDataStr) {
+    const jobData = await redis.get(jobId);
+
+    if (!jobData) {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const jobData = JSON.parse(jobDataStr);
-    
-    if (jobData.status !== 'completed' || !jobData.outputS3Key) {
-      return res.status(400).json({ error: 'Staged image not ready' });
+    const job = JSON.parse(jobData);
+
+    if (job.status !== 'completed') {
+      return res.status(400).json({ error: 'Job not completed yet', status: job.status });
     }
 
     // Get staged image from S3
-    const getParams = {
+    const s3Response = await s3Client.send(new GetObjectCommand({
       Bucket: process.env.S3_OUTPUTS_BUCKET,
-      Key: jobData.outputS3Key,
-    };
+      Key: job.stagedImage,
+    }));
+
+    // Stream the image to response
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Disposition', `attachment; filename="staged_${jobId}.png"`);
     
-    const s3Response = await s3Client.send(new GetObjectCommand(getParams));
-    const imageBuffer = await streamToBuffer(s3Response.Body);
-
-    res.set('Content-Type', s3Response.ContentType || 'image/png');
-    res.set('Content-Disposition', `attachment; filename="${jobData.outputS3Key.split('/').pop()}"`);
-    res.send(imageBuffer);
-
+    for await (const chunk of s3Response.Body) {
+      res.write(chunk);
+    }
+    res.end();
   } catch (error) {
     console.error('Download error:', error);
-    Sentry.captureException(error);
-    res.status(500).json({ error: 'Download failed' });
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    res.status(500).json({ error: 'Failed to download image' });
   }
 });
 
-// Mailgun webhook endpoint for inbound emails
+// Mailgun webhook endpoint
 app.post('/api/webhook/mailgun', upload.any(), async (req, res) => {
   try {
-    console.log('📧 Received Mailgun webhook');
-    
-    const sender = req.body.sender || req.body.from;
-    const subject = req.body.subject || 'Property Staging Request';
-    
-    // Process attached images
-    const attachments = req.files || [];
-    const jobIds = [];
+    const { sender } = req.body;
+    const attachments = req.files;
 
-    for (const file of attachments) {
-      if (file.mimetype.startsWith('image/')) {
-        const fileName = `${Date.now()}-${file.originalname}`;
-        const s3Key = `uploads/${fileName}`;
-
-        // Upload to S3
-        const uploadParams = {
-          Bucket: process.env.S3_UPLOADS_BUCKET,
-          Key: s3Key,
-          Body: file.buffer,
-          ContentType: file.mimetype,
-        };
-
-        await s3Client.send(new PutObjectCommand(uploadParams));
-
-        // Create job
-        const jobId = `job-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        const jobData = {
-          jobId,
-          s3Key,
-          fileName,
-          userEmail: sender,
-          status: 'pending',
-          source: 'email',
-          createdAt: new Date().toISOString(),
-        };
-
-        await redis.set(jobId, JSON.stringify(jobData));
-        await redis.lpush('staging-queue', jobId);
-        jobIds.push(jobId);
-        
-        console.log(`✅ Email attachment queued: ${jobId}`);
-      }
+    if (!attachments || attachments.length === 0) {
+      return res.status(400).json({ error: 'No attachments found' });
     }
 
-    res.json({ 
-      success: true, 
-      message: `Received ${jobIds.length} images`,
-      jobIds 
-    });
+    // Process first image attachment
+    const imageFile = attachments.find(f => f.mimetype.startsWith('image/'));
+    if (!imageFile) {
+      return res.status(400).json({ error: 'No image attachment found' });
+    }
 
+    // Generate job ID
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const s3Key = `uploads/${jobId}/${imageFile.originalname}`;
+
+    // Upload to S3
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.S3_UPLOADS_BUCKET,
+      Key: s3Key,
+      Body: imageFile.buffer,
+      ContentType: imageFile.mimetype,
+    }));
+
+    // Store job metadata
+    const job = {
+      jobId,
+      email: sender,
+      originalImage: s3Key,
+      status: 'processing',
+      createdAt: new Date().toISOString(),
+    };
+    await redis.set(jobId, JSON.stringify(job));
+
+    // Start processing
+    processImageAsync(jobId, job);
+
+    res.json({ jobId, status: 'processing' });
   } catch (error) {
-    console.error('Mailgun webhook error:', error);
-    Sentry.captureException(error);
-    res.status(500).json({ error: 'Webhook processing failed' });
+    console.error('Webhook error:', error);
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    res.status(500).json({ error: 'Failed to process webhook' });
   }
 });
 
-// Helper function to convert stream to buffer
-async function streamToBuffer(stream) {
-  const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
+// Error handler (Sentry)
+if (process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.errorHandler());
 }
-
-// Sentry error handler
-app.use(Sentry.Handlers.errorHandler());
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Property Perfected backend running on port ${PORT}`);
-  console.log(`✅ S3 Uploads Bucket: ${process.env.S3_UPLOADS_BUCKET}`);
-  console.log(`✅ S3 Outputs Bucket: ${process.env.S3_OUTPUTS_BUCKET}`);
-  console.log(`✅ OpenAI Model: ${process.env.OPENAI_IMAGE_MODEL || 'dall-e-2'}`);
-  console.log(`✅ Redis: Connected`);
-  console.log(`✅ Sentry: Monitoring enabled`);
+  console.log(`🚀 Property Perfected API running on port ${PORT}`);
+  console.log(`📍 Environment: ${process.env.SENTRY_ENV || 'production'}`);
+  console.log(`🔑 OpenAI Model: ${process.env.OPENAI_IMAGE_MODEL || 'dall-e-2'}`);
 });
