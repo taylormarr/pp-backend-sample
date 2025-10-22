@@ -5,26 +5,11 @@ const cors = require('cors');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { Redis } = require('@upstash/redis');
 const OpenAI = require('openai');
-const Sentry = require('@sentry/node');
 const axios = require('axios');
 const FormData = require('form-data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Initialize Sentry only if DSN is provided
-if (process.env.SENTRY_DSN) {
-  Sentry.init({
-    dsn: process.env.SENTRY_DSN,
-    environment: process.env.SENTRY_ENV || 'production',
-    tracesSampleRate: parseFloat(process.env.SENTRY_TRACES_SAMPLE_RATE || '1.0'),
-    profilesSampleRate: parseFloat(process.env.SENTRY_PROFILES_SAMPLE_RATE || '1.0'),
-  });
-  app.use(Sentry.Handlers.requestHandler());
-  console.log('✅ Sentry initialized');
-} else {
-  console.log('⚠️  Sentry DSN not provided, skipping Sentry initialization');
-}
 
 // Middleware
 app.use(cors());
@@ -66,6 +51,7 @@ app.get('/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'Property Perfected API is running',
+    version: '1.0.0',
     endpoints: {
       upload: 'POST /api/upload',
       process: 'POST /api/process/:jobId',
@@ -90,6 +76,8 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
     const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const s3Key = `uploads/${jobId}/${file.originalname}`;
 
+    console.log(`📤 Uploading image for job ${jobId}`);
+
     // Upload to S3
     await s3Client.send(new PutObjectCommand({
       Bucket: process.env.S3_UPLOADS_BUCKET,
@@ -107,6 +95,8 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
       createdAt: new Date().toISOString(),
     }));
 
+    console.log(`✅ Job ${jobId} uploaded successfully`);
+
     res.json({
       jobId,
       status: 'uploaded',
@@ -114,8 +104,7 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
     });
   } catch (error) {
     console.error('Upload error:', error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
-    res.status(500).json({ error: 'Failed to upload image' });
+    res.status(500).json({ error: 'Failed to upload image', details: error.message });
   }
 });
 
@@ -123,6 +112,8 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
 app.post('/api/process/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
+
+    console.log(`🔄 Processing job ${jobId}`);
 
     // Get job metadata from Redis
     const jobData = await redis.get(jobId);
@@ -136,7 +127,7 @@ app.post('/api/process/:jobId', async (req, res) => {
     job.status = 'processing';
     await redis.set(jobId, JSON.stringify(job));
 
-    // Start async processing (in production, use a queue worker)
+    // Start async processing
     processImageAsync(jobId, job);
 
     res.json({
@@ -146,14 +137,15 @@ app.post('/api/process/:jobId', async (req, res) => {
     });
   } catch (error) {
     console.error('Process error:', error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
-    res.status(500).json({ error: 'Failed to start processing' });
+    res.status(500).json({ error: 'Failed to start processing', details: error.message });
   }
 });
 
 // Async processing function
 async function processImageAsync(jobId, job) {
   try {
+    console.log(`🎨 Starting AI staging for job ${jobId}`);
+
     // Download image from S3
     const s3Response = await s3Client.send(new GetObjectCommand({
       Bucket: process.env.S3_UPLOADS_BUCKET,
@@ -167,9 +159,7 @@ async function processImageAsync(jobId, job) {
     }
     const imageBuffer = Buffer.concat(chunks);
 
-    // Convert to base64 for OpenAI
-    const base64Image = imageBuffer.toString('base64');
-    const imageUrl = `data:${s3Response.ContentType};base64,${base64Image}`;
+    console.log(`🤖 Calling OpenAI DALL-E for job ${jobId}`);
 
     // Call OpenAI DALL-E for staging
     const response = await openai.images.edit({
@@ -181,6 +171,8 @@ async function processImageAsync(jobId, job) {
     });
 
     const stagedImageUrl = response.data[0].url;
+
+    console.log(`📥 Downloading staged image for job ${jobId}`);
 
     // Download staged image
     const stagedImageResponse = await axios.get(stagedImageUrl, { responseType: 'arraybuffer' });
@@ -204,7 +196,6 @@ async function processImageAsync(jobId, job) {
     console.log(`✅ Job ${jobId} completed successfully`);
   } catch (error) {
     console.error(`❌ Job ${jobId} failed:`, error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
 
     // Update job status to failed
     job.status = 'failed';
@@ -226,8 +217,7 @@ app.get('/api/job/:jobId', async (req, res) => {
     res.json(JSON.parse(jobData));
   } catch (error) {
     console.error('Status check error:', error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
-    res.status(500).json({ error: 'Failed to check job status' });
+    res.status(500).json({ error: 'Failed to check job status', details: error.message });
   }
 });
 
@@ -263,8 +253,7 @@ app.get('/api/download/:jobId', async (req, res) => {
     res.end();
   } catch (error) {
     console.error('Download error:', error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
-    res.status(500).json({ error: 'Failed to download image' });
+    res.status(500).json({ error: 'Failed to download image', details: error.message });
   }
 });
 
@@ -312,19 +301,14 @@ app.post('/api/webhook/mailgun', upload.any(), async (req, res) => {
     res.json({ jobId, status: 'processing' });
   } catch (error) {
     console.error('Webhook error:', error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
-    res.status(500).json({ error: 'Failed to process webhook' });
+    res.status(500).json({ error: 'Failed to process webhook', details: error.message });
   }
 });
-
-// Error handler (Sentry)
-if (process.env.SENTRY_DSN) {
-  app.use(Sentry.Handlers.errorHandler());
-}
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Property Perfected API running on port ${PORT}`);
-  console.log(`📍 Environment: ${process.env.SENTRY_ENV || 'production'}`);
   console.log(`🔑 OpenAI Model: ${process.env.OPENAI_IMAGE_MODEL || 'dall-e-2'}`);
+  console.log(`📦 S3 Uploads: ${process.env.S3_UPLOADS_BUCKET}`);
+  console.log(`📦 S3 Outputs: ${process.env.S3_OUTPUTS_BUCKET}`);
 });
