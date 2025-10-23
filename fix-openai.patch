@@ -1,0 +1,10 @@
+We need to convert the buffer to a File object for OpenAI.
+The OpenAI SDK expects a File-like object with a name property.
+
+Change line 165 from:
+  image: imageBuffer,
+
+To:
+  image: new File([imageBuffer], 'image.png', { type: 'image/png' }),
+
+This creates a proper File object that OpenAI can process.

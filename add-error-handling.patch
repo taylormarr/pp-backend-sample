@@ -1,0 +1,24 @@
+We need to add a try-catch around the JSON.parse to handle corrupted jobs gracefully.
+
+In the /api/process/:jobId endpoint, wrap the job retrieval in better error handling:
+
+try {
+  const jobData = await redis.get(jobId);
+  if (!jobData) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+  
+  // Handle both string and object formats
+  let job;
+  try {
+    job = typeof jobData === 'string' ? JSON.parse(jobData) : jobData;
+  } catch (parseError) {
+    console.error(`Failed to parse job ${jobId}, deleting corrupted job`);
+    await redis.del(jobId);
+    return res.status(400).json({ error: 'Corrupted job data, please upload again' });
+  }
+  
+  // ... rest of processing
+} catch (error) {
+  // ... error handling
+}

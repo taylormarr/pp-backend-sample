@@ -6,7 +6,6 @@ const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/clien
 const sharp = require('sharp');
 const { Redis } = require('@upstash/redis');
 const OpenAI = require('openai');
-const Replicate = require('replicate');
 const axios = require('axios');
 const FormData = require('form-data');
 
@@ -33,15 +32,10 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// Configure OpenAI (for GPT-4 Vision analysis)
+// Configure OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   organization: process.env.OPENAI_ORG_ID,
-});
-
-// Configure Replicate (for RoomGPT)
-const replicate = new Replicate({
-  auth: process.env.REPLICATE_API_TOKEN,
 });
 
 // Configure Multer for file uploads
@@ -58,7 +52,7 @@ app.get('/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'Property Perfected API is running',
-    version: '3.0.0 - RoomGPT Integration (Proof of Concept)',
+    version: '1.0.0',
     endpoints: {
       upload: 'POST /api/upload',
       process: 'POST /api/process/:jobId',
@@ -130,6 +124,7 @@ app.post('/api/process/:jobId', async (req, res) => {
 
     const job = typeof jobData === "string" ? JSON.parse(jobData) : jobData;
 
+
     // Check if job is too old (more than 5 minutes)
     const jobAge = Date.now() - new Date(job.createdAt).getTime();
     const MAX_JOB_AGE = 5 * 60 * 1000; // 5 minutes
@@ -144,7 +139,6 @@ app.post('/api/process/:jobId', async (req, res) => {
         message: "This job is too old. Please upload your image again." 
       });
     }
-    
     // Update status to processing
     job.status = 'processing';
     await redis.set(jobId, JSON.stringify(job));
@@ -163,67 +157,60 @@ app.post('/api/process/:jobId', async (req, res) => {
   }
 });
 
-// Helper function to get public URL for S3 object
-async function getPublicUrlForS3Object(bucket, key) {
-  // For now, we'll download and re-upload to a temporary public location
-  // In production, you might want to use S3 presigned URLs
-  const s3Response = await s3Client.send(new GetObjectCommand({
-    Bucket: bucket,
-    Key: key,
-  }));
-
-  const chunks = [];
-  for await (const chunk of s3Response.Body) {
-    chunks.push(chunk);
-  }
-  const imageBuffer = Buffer.concat(chunks);
+// Preprocess image for OpenAI: convert to PNG and resize to 1024x1024
+async function preprocessImageForOpenAI(imageBuffer) {
+  console.log("🖼️  Preprocessing image for OpenAI (converting to 1024x1024 PNG)");
+  const processedBuffer = await sharp(imageBuffer)
+    .resize(1024, 1024, {
+      fit: "cover",  // Crop to fill the square
+      position: "center"
+    })
+    .ensureAlpha()
+    .png()
+    .toBuffer();
   
-  return imageBuffer;
+  return processedBuffer;
 }
 
-// Async processing function using RoomGPT
+// Async processing function
 async function processImageAsync(jobId, job) {
   try {
-    console.log(`🎨 Starting RoomGPT staging for job ${jobId}`);
+    console.log(`🎨 Starting AI staging for job ${jobId}`);
 
     // Download image from S3
-    const imageBuffer = await getPublicUrlForS3Object(
-      process.env.S3_UPLOADS_BUCKET,
-      job.originalImage
-    );
+    const s3Response = await s3Client.send(new GetObjectCommand({
+      Bucket: process.env.S3_UPLOADS_BUCKET,
+      Key: job.originalImage,
+    }));
 
-    console.log(`📸 Image downloaded (${imageBuffer.length} bytes)`);
+    // Convert stream to buffer
+    const chunks = [];
+    for await (const chunk of s3Response.Body) {
+      chunks.push(chunk);
+    }
+    const imageBuffer = Buffer.concat(chunks);
 
-    // Convert buffer to base64 data URL for RoomGPT
-    const base64Image = imageBuffer.toString('base64');
-    const dataUrl = `data:image/png;base64,${base64Image}`;
+    // Preprocess image for OpenAI
+    const processedImageBuffer = await preprocessImageForOpenAI(imageBuffer);
 
-    // Run RoomGPT via Replicate
-    console.log(`🏠 Running RoomGPT model...`);
-    
-    const output = await replicate.run(
-      "thijssdaniels/room-gpt:bfcb42751f8f702e4661daa3e592c960cdec178831df79d361c54a78e8ec87e1",
-      {
-        input: {
-          image: dataUrl,
-          room_type: "Living Room",
-          theme: "Modern"
-        }
-      }
-    );
+    console.log(`🤖 Calling OpenAI DALL-E for job ${jobId}`);
 
-    console.log(`✅ RoomGPT completed, output:`, output);
+    // Call OpenAI DALL-E for staging
+    const response = await openai.images.edit({
+      model: process.env.OPENAI_IMAGE_MODEL || 'dall-e-2',
+      image: new File([processedImageBuffer], "image.png", { type: "image/png" }),
+      prompt: 'Transform this empty room into a beautifully staged, professionally furnished space. Add modern furniture, tasteful decor, proper lighting, and create an inviting atmosphere that would appeal to potential home buyers. Maintain the room\'s architecture and structure.',
+      n: 1,
+      size: '1024x1024',
+    });
 
-    // RoomGPT returns a URL to the staged image
-    const stagedImageUrl = Array.isArray(output) ? output[0] : output;
-    
-    console.log(`📥 Downloading staged image from: ${stagedImageUrl}`);
+    const stagedImageUrl = response.data[0].url;
 
-    // Download the staged image
+    console.log(`📥 Downloading staged image for job ${jobId}`);
+
+    // Download staged image
     const stagedImageResponse = await axios.get(stagedImageUrl, { responseType: 'arraybuffer' });
     const stagedImageBuffer = Buffer.from(stagedImageResponse.data);
-    
-    console.log(`✅ Downloaded staged image (${stagedImageBuffer.length} bytes)`);
 
     // Upload staged image to S3
     const outputKey = `outputs/${jobId}/staged_${Date.now()}.png`;
@@ -234,15 +221,13 @@ async function processImageAsync(jobId, job) {
       ContentType: 'image/png',
     }));
 
-    console.log(`☁️  Uploaded to S3: ${outputKey}`);
-
     // Update job status
     job.status = 'completed';
     job.stagedImage = outputKey;
     job.completedAt = new Date().toISOString();
     await redis.set(jobId, JSON.stringify(job));
 
-    console.log(`✅ Job ${jobId} completed successfully with RoomGPT`);
+    console.log(`✅ Job ${jobId} completed successfully`);
   } catch (error) {
     console.error(`❌ Job ${jobId} failed:`, error);
 
@@ -263,8 +248,7 @@ app.get('/api/job/:jobId', async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const job = typeof jobData === "string" ? JSON.parse(jobData) : jobData;
-    res.json(job);
+    res.json(typeof jobData === "string" ? JSON.parse(jobData) : jobData);
   } catch (error) {
     console.error('Status check error:', error);
     res.status(500).json({ error: 'Failed to check job status', details: error.message });
@@ -293,16 +277,14 @@ app.get('/api/download/:jobId', async (req, res) => {
       Key: job.stagedImage,
     }));
 
-    // Convert stream to buffer
-    const chunks = [];
-    for await (const chunk of s3Response.Body) {
-      chunks.push(chunk);
-    }
-    const imageBuffer = Buffer.concat(chunks);
-
+    // Stream the image to response
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Content-Disposition', `attachment; filename="staged_${jobId}.png"`);
-    res.send(imageBuffer);
+    
+    for await (const chunk of s3Response.Body) {
+      res.write(chunk);
+    }
+    res.end();
   } catch (error) {
     console.error('Download error:', error);
     res.status(500).json({ error: 'Failed to download image', details: error.message });
@@ -310,25 +292,57 @@ app.get('/api/download/:jobId', async (req, res) => {
 });
 
 // Mailgun webhook endpoint
-app.post('/api/webhook/mailgun', async (req, res) => {
+app.post('/api/webhook/mailgun', upload.any(), async (req, res) => {
   try {
-    console.log('📧 Received Mailgun webhook');
-    
-    // TODO: Implement email processing
-    // 1. Extract attachments from email
-    // 2. Upload to S3
-    // 3. Create job
-    // 4. Process image
-    // 5. Send result back via email
-    
-    res.json({ received: true });
+    const { sender } = req.body;
+    const attachments = req.files;
+
+    if (!attachments || attachments.length === 0) {
+      return res.status(400).json({ error: 'No attachments found' });
+    }
+
+    // Process first image attachment
+    const imageFile = attachments.find(f => f.mimetype.startsWith('image/'));
+    if (!imageFile) {
+      return res.status(400).json({ error: 'No image attachment found' });
+    }
+
+    // Generate job ID
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const s3Key = `uploads/${jobId}/${imageFile.originalname}`;
+
+    // Upload to S3
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.S3_UPLOADS_BUCKET,
+      Key: s3Key,
+      Body: imageFile.buffer,
+      ContentType: imageFile.mimetype,
+    }));
+
+    // Store job metadata
+    const job = {
+      jobId,
+      email: sender,
+      originalImage: s3Key,
+      status: 'processing',
+      createdAt: new Date().toISOString(),
+    };
+    await redis.set(jobId, JSON.stringify(job));
+
+    // Start processing
+    processImageAsync(jobId, job);
+
+    res.json({ jobId, status: 'processing' });
   } catch (error) {
     console.error('Webhook error:', error);
-    res.status(500).json({ error: 'Webhook processing failed' });
+    res.status(500).json({ error: 'Failed to process webhook', details: error.message });
   }
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`🚀 Property Perfected API running on port ${PORT}`);
-  console.log(`🏠 Using RoomGPT via Replicate for virtual staging`);
+  console.log(`🔑 OpenAI Model: ${process.env.OPENAI_IMAGE_MODEL || 'dall-e-2'}`);
+  console.log(`📦 S3 Uploads: ${process.env.S3_UPLOADS_BUCKET}`);
+  console.log(`📦 S3 Outputs: ${process.env.S3_OUTPUTS_BUCKET}`);
 });

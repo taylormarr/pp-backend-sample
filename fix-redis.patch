@@ -1,0 +1,13 @@
+--- a/server.js
++++ b/server.js
+@@ -120,7 +120,8 @@
+     const jobData = await redis.get(jobId);
+     if (!jobData) {
+       return res.status(404).json({ error: 'Job not found' });
+     }
+ 
+-    const job = JSON.parse(jobData);
++    // Upstash Redis automatically parses JSON, so check if it's already an object
++    const job = typeof jobData === 'string' ? JSON.parse(jobData) : jobData;
+ 
+     // Update status to processing

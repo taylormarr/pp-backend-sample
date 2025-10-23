@@ -1,0 +1,15 @@
+
+// Preprocess image for OpenAI: convert to PNG and resize to 1024x1024
+async function preprocessImageForOpenAI(imageBuffer) {
+  console.log('🖼️  Preprocessing image for OpenAI (converting to 1024x1024 PNG)');
+  const processedBuffer = await sharp(imageBuffer)
+    .resize(1024, 1024, {
+      fit: 'cover',  // Crop to fill the square
+      position: 'center'
+    })
+    .png()
+    .toBuffer();
+  
+  return processedBuffer;
+}
+
