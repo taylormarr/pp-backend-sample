@@ -35,6 +35,7 @@
             margin-bottom: 20px;
         }
         .upload-area:hover { border-color: #764ba2; background: #f8f9ff; }
+        .upload-area.dragover { border-color: #764ba2; background: #f0f0ff; }
         input[type="file"] { display: none; }
         input[type="email"] {
             width: 100%;
@@ -54,7 +55,9 @@
             font-size: 18px;
             font-weight: 600;
             cursor: pointer;
+            transition: transform 0.2s;
         }
+        button:hover:not(:disabled) { transform: translateY(-2px); }
         button:disabled { opacity: 0.6; cursor: not-allowed; }
         .status {
             margin-top: 20px;
@@ -62,11 +65,22 @@
             border-radius: 8px;
             display: none;
         }
-        .status.success { background: #d4edda; color: #155724; }
-        .status.error { background: #f8d7da; color: #721c24; }
-        .status.processing { background: #fff3cd; color: #856404; }
-        .preview { margin-top: 20px; text-align: center; }
-        .preview img { max-width: 100%; border-radius: 10px; margin-top: 10px; }
+        .status.processing { background: #fff3cd; color: #856404; display: block; }
+        .status.success { background: #d4edda; color: #155724; display: block; }
+        .status.error { background: #f8d7da; color: #721c24; display: block; }
+        .preview { margin-top: 20px; }
+        .preview img { max-width: 100%; border-radius: 8px; margin-top: 10px; }
+        .download-btn {
+            margin-top: 15px;
+            background: #28a745;
+            display: inline-block;
+            padding: 12px 24px;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+        .download-btn:hover { background: #218838; }
     </style>
 </head>
 <body>
@@ -75,14 +89,13 @@
         <p class="subtitle">AI-Powered Real Estate Staging</p>
         
         <div class="upload-area" id="uploadArea">
-            <div style="font-size: 48px; margin-bottom: 15px;">📸</div>
+            <div style="font-size: 48px; margin-bottom: 10px;">📸</div>
             <p><strong>Click to upload</strong> or drag and drop</p>
-            <p style="font-size: 14px; color: #999; margin-top: 10px;">PNG, JPG up to 10MB</p>
-            <input type="file" id="fileInput" accept="image/*">
+            <p style="color: #999; font-size: 14px; margin-top: 5px;">PNG, JPG up to 10MB</p>
         </div>
         
-        <input type="email" id="emailInput" placeholder="Your email (optional)" value="test@propertyperfected.com">
-        
+        <input type="file" id="fileInput" accept="image/png,image/jpeg" />
+        <input type="email" id="emailInput" placeholder="Your email" value="test@propertyperfected.com" />
         <button id="uploadBtn" disabled>Upload & Stage Property</button>
         
         <div class="status" id="status"></div>
@@ -101,24 +114,48 @@
         
         uploadArea.addEventListener('click', () => fileInput.click());
         
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                selectedFile = e.dataTransfer.files[0];
+                uploadBtn.disabled = false;
+                showPreview();
+            }
+        });
+        
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
                 selectedFile = e.target.files[0];
                 uploadBtn.disabled = false;
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    preview.innerHTML = '<p><strong>Selected:</strong> ' + selectedFile.name + '</p><img src="' + e.target.result + '">';
-                };
-                reader.readAsDataURL(selectedFile);
+                showPreview();
             }
         });
+        
+        function showPreview() {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                preview.innerHTML = '<p><strong>Selected:</strong> ' + selectedFile.name + '</p><img src="' + e.target.result + '">';
+            };
+            reader.readAsDataURL(selectedFile);
+        }
         
         uploadBtn.addEventListener('click', async () => {
             if (!selectedFile) return;
             uploadBtn.disabled = true;
-            showStatus('Uploading and processing... This may take 30-60 seconds', 'processing');
+            showStatus('📤 Uploading image...', 'processing');
             
             try {
+                // Step 1: Upload
                 const formData = new FormData();
                 formData.append('image', selectedFile);
                 formData.append('email', document.getElementById('emailInput').value);
@@ -131,12 +168,44 @@
                 const uploadData = await uploadResponse.json();
                 const jobId = uploadData.jobId;
                 
-                const processResponse = await fetch(API_URL + '/api/process/' + jobId, {
+                showStatus('🎨 Starting AI staging process...', 'processing');
+                
+                // Step 2: Start processing
+                await fetch(API_URL + '/api/process/' + jobId, {
                     method: 'POST'
                 });
                 
-                const processData = await processResponse.json();
-                showStatus('✅ Success! Download URL: ' + processData.downloadUrl, 'success');
+                showStatus('⏳ AI is staging your property... (this takes 30-60 seconds)', 'processing');
+                
+                // Step 3: Poll for completion
+                let attempts = 0;
+                const maxAttempts = 30; // 30 attempts * 3 seconds = 90 seconds max
+                
+                const checkStatus = async () => {
+                    attempts++;
+                    
+                    const statusResponse = await fetch(API_URL + '/api/job/' + jobId);
+                    const jobData = await statusResponse.json();
+                    
+                    if (jobData.status === 'completed') {
+                        const downloadUrl = API_URL + '/api/download/' + jobId;
+                        showStatus('✅ Success! Your property has been staged!', 'success');
+                        preview.innerHTML += '<br><a href="' + downloadUrl + '" class="download-btn" download>📥 Download Staged Image</a>';
+                        uploadBtn.disabled = false;
+                    } else if (jobData.status === 'failed') {
+                        showStatus('❌ Error: ' + (jobData.error || 'Processing failed'), 'error');
+                        uploadBtn.disabled = false;
+                    } else if (attempts >= maxAttempts) {
+                        showStatus('⏱️ Processing is taking longer than expected. Please check back in a moment.', 'error');
+                        uploadBtn.disabled = false;
+                    } else {
+                        // Still processing, check again in 3 seconds
+                        setTimeout(checkStatus, 3000);
+                    }
+                };
+                
+                // Start checking after 5 seconds (give it time to start)
+                setTimeout(checkStatus, 5000);
                 
             } catch (error) {
                 showStatus('❌ Error: ' + error.message, 'error');
