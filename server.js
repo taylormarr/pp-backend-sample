@@ -52,7 +52,7 @@ app.get('/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'Property Perfected API is running',
-    version: '2.0.0 - GPT-4 Vision + DALL-E 3',
+    version: '2.1.0 - GPT-4 Vision + DALL-E 3 (Architecture Preserving)',
     endpoints: {
       upload: 'POST /api/upload',
       process: 'POST /api/process/:jobId',
@@ -196,7 +196,7 @@ async function processImageAsync(jobId, job) {
           content: [
             {
               type: "text",
-              text: "Analyze this empty room image in detail for virtual staging. Describe: 1) Room type (living room, bedroom, etc.), 2) Architectural features (windows, doors, ceiling height, moldings), 3) Flooring type and color, 4) Wall color and texture, 5) Natural lighting and light sources, 6) Room dimensions and layout, 7) Any existing fixtures or built-ins. Then suggest specific furniture pieces, their placement, style (modern, traditional, etc.), colors, and decor that would make this space appealing to home buyers. Be very specific and detailed."
+              text: "Analyze this room image for virtual staging. Describe ONLY what furniture and decor should be added. Do NOT describe the room's existing architecture (walls, windows, floors, ceiling) - I need to preserve those exactly. Focus on: 1) What type of room this is, 2) What furniture pieces would work (sofa, chairs, tables, etc.), 3) What style (modern, traditional, etc.), 4) What colors and materials, 5) What decor items (plants, artwork, rugs, etc.). Be specific about furniture placement and style."
             },
             {
               type: "image_url",
@@ -207,21 +207,22 @@ async function processImageAsync(jobId, job) {
           ]
         }
       ],
-      max_tokens: 800
+      max_tokens: 500
     });
 
-    const roomAnalysis = visionResponse.choices[0].message.content;
-    console.log(`✅ Room analysis complete (${roomAnalysis.length} chars)`);
-    console.log(`📝 Analysis preview: ${roomAnalysis.substring(0, 300)}...`);
+    const furnitureSuggestions = visionResponse.choices[0].message.content;
+    console.log(`✅ Furniture suggestions: ${furnitureSuggestions.substring(0, 200)}...`);
 
-    // Step 2: Generate staged image with DALL-E 3
+    // Step 2: Generate staged image with DALL-E 3 using architecture-preserving prompt
     console.log(`🎨 Step 2: Generating staged image with DALL-E 3...`);
     
-    const stagingPrompt = `Create a photorealistic, professionally staged interior design photo based on this analysis: ${roomAnalysis}
+    const stagingPrompt = `Virtually stage this room by adding furniture and decor ONLY. CRITICAL: Keep the room's walls, windows, doors, flooring, ceiling, lighting, and all architectural features EXACTLY as shown in the original photo. Do not change the room structure, perspective, or architecture in any way.
 
-IMPORTANT: Maintain the EXACT room architecture, walls, windows, doors, flooring, and lighting from the original photo. Only add furniture, decor, and styling. The room structure must remain identical. Create an elegant, modern staging that appeals to home buyers.`;
+Add these furnishings: ${furnitureSuggestions}
+
+The result must look like the same room with furniture added, not a different room. Maintain the exact camera angle, lighting conditions, and room dimensions. Only add furniture, decor, and styling elements.`;
     
-    console.log(`📋 DALL-E 3 prompt length: ${stagingPrompt.length} chars`);
+    console.log(`📋 DALL-E 3 prompt: ${stagingPrompt.substring(0, 300)}...`);
     
     const dalleResponse = await openai.images.generate({
       model: 'dall-e-3',
@@ -256,7 +257,6 @@ IMPORTANT: Maintain the EXACT room architecture, walls, windows, doors, flooring
     job.status = 'completed';
     job.stagedImage = outputKey;
     job.completedAt = new Date().toISOString();
-    job.roomAnalysis = roomAnalysis; // Store analysis for debugging
     await redis.set(jobId, JSON.stringify(job));
 
     console.log(`✅ Job ${jobId} completed successfully`);
@@ -347,5 +347,5 @@ app.post('/api/webhook/mailgun', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Property Perfected API running on port ${PORT}`);
-  console.log(`🤖 Using GPT-4 Vision + DALL-E 3 for staging`);
+  console.log(`🤖 Using GPT-4 Vision + DALL-E 3 for staging (Architecture Preserving)`);
 });
