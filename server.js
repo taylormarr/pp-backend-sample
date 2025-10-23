@@ -52,7 +52,7 @@ app.get('/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'Property Perfected API is running',
-    version: '2.1.0 - GPT-4 Vision + DALL-E 3 (Architecture Preserving)',
+    version: '2.2.0 - GPT-4 Vision + DALL-E 3 (ChatGPT-Style Prompts)',
     endpoints: {
       upload: 'POST /api/upload',
       process: 'POST /api/process/:jobId',
@@ -163,10 +163,10 @@ function bufferToDataUrl(buffer, mimeType = 'image/png') {
   return `data:${mimeType};base64,${base64}`;
 }
 
-// Async processing function using GPT-4 Vision + DALL-E 3
+// Async processing function using GPT-4 Vision + DALL-E 3 (ChatGPT-style)
 async function processImageAsync(jobId, job) {
   try {
-    console.log(`🎨 Starting AI staging for job ${jobId} (GPT-4 Vision + DALL-E 3)`);
+    console.log(`🎨 Starting AI staging for job ${jobId} (ChatGPT-Style Approach)`);
 
     // Download image from S3
     const s3Response = await s3Client.send(new GetObjectCommand({
@@ -183,7 +183,7 @@ async function processImageAsync(jobId, job) {
 
     console.log(`📸 Image downloaded (${imageBuffer.length} bytes)`);
 
-    // Step 1: Use GPT-4 Vision to analyze the room
+    // Step 1: Use GPT-4 Vision to analyze the room - ONLY for furniture suggestions
     console.log(`🔍 Step 1: Analyzing room with GPT-4 Vision...`);
     
     const imageDataUrl = bufferToDataUrl(imageBuffer, s3Response.ContentType || 'image/png');
@@ -196,7 +196,7 @@ async function processImageAsync(jobId, job) {
           content: [
             {
               type: "text",
-              text: "Analyze this room image for virtual staging. Describe ONLY what furniture and decor should be added. Do NOT describe the room's existing architecture (walls, windows, floors, ceiling) - I need to preserve those exactly. Focus on: 1) What type of room this is, 2) What furniture pieces would work (sofa, chairs, tables, etc.), 3) What style (modern, traditional, etc.), 4) What colors and materials, 5) What decor items (plants, artwork, rugs, etc.). Be specific about furniture placement and style."
+              text: "You are analyzing this room for virtual staging. Describe what furniture and decor should be added to make it look professionally staged. Be specific about: 1) Furniture pieces (sofa, chairs, tables, beds, etc.), 2) Style (modern, traditional, farmhouse, etc.), 3) Colors and materials, 4) Decor items (plants, artwork, rugs, lighting). Keep it concise and focused on what to ADD, not what currently exists."
             },
             {
               type: "image_url",
@@ -207,20 +207,28 @@ async function processImageAsync(jobId, job) {
           ]
         }
       ],
-      max_tokens: 500
+      max_tokens: 300
     });
 
     const furnitureSuggestions = visionResponse.choices[0].message.content;
     console.log(`✅ Furniture suggestions: ${furnitureSuggestions.substring(0, 200)}...`);
 
-    // Step 2: Generate staged image with DALL-E 3 using architecture-preserving prompt
+    // Step 2: Generate staged image with DALL-E 3 using ChatGPT-style prompt
     console.log(`🎨 Step 2: Generating staged image with DALL-E 3...`);
     
-    const stagingPrompt = `Virtually stage this room by adding furniture and decor ONLY. CRITICAL: Keep the room's walls, windows, doors, flooring, ceiling, lighting, and all architectural features EXACTLY as shown in the original photo. Do not change the room structure, perspective, or architecture in any way.
+    // This is the KEY: Match ChatGPT's explicit preservation instructions
+    const stagingPrompt = `Virtually stage this room by adding furniture and decor. 
+
+CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE:
+- Keep the EXACT room shape, layout, and structure
+- Do NOT modify, remove, or change the walls, windows, doors, floors, ceiling, or any architectural features
+- Do NOT change the room's dimensions, perspective, or camera angle
+- Do NOT alter the lighting conditions or natural light sources
+- ONLY add furniture, decor, and styling elements
 
 Add these furnishings: ${furnitureSuggestions}
 
-The result must look like the same room with furniture added, not a different room. Maintain the exact camera angle, lighting conditions, and room dimensions. Only add furniture, decor, and styling elements.`;
+The result must look like the SAME ROOM with furniture added, not a different room. This is for a real estate listing and must maintain architectural accuracy.`;
     
     console.log(`📋 DALL-E 3 prompt: ${stagingPrompt.substring(0, 300)}...`);
     
@@ -347,5 +355,5 @@ app.post('/api/webhook/mailgun', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Property Perfected API running on port ${PORT}`);
-  console.log(`🤖 Using GPT-4 Vision + DALL-E 3 for staging (Architecture Preserving)`);
+  console.log(`🤖 Using GPT-4 Vision + DALL-E 3 (ChatGPT-Style Prompts)`);
 });
