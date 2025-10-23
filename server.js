@@ -193,12 +193,23 @@ async function processImageAsync(jobId, job) {
     // Preprocess image for OpenAI
     const processedImageBuffer = await preprocessImageForOpenAI(imageBuffer);
 
+
+    // Create a white mask (tells DALL-E to edit the entire image)
+    const maskBuffer = await sharp({
+      create: {
+        width: 1024,
+        height: 1024,
+        channels: 4,
+        background: { r: 255, g: 255, b: 255, alpha: 1 }
+      }
+    }).png().toBuffer();
     console.log(`🤖 Calling OpenAI DALL-E for job ${jobId}`);
 
     // Call OpenAI DALL-E for staging
     const response = await openai.images.edit({
       model: process.env.OPENAI_IMAGE_MODEL || 'dall-e-2',
       image: new File([processedImageBuffer], "image.png", { type: "image/png" }),
+      mask: new File([maskBuffer], "mask.png", { type: "image/png" }),
       prompt: 'Transform this empty room into a beautifully staged, professionally furnished space. Add modern furniture, tasteful decor, proper lighting, and create an inviting atmosphere that would appeal to potential home buyers. Maintain the room\'s architecture and structure.',
       n: 1,
       size: '1024x1024',
